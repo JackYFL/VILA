@@ -783,7 +783,9 @@ def train():
     )
 
     # Add a training step_end callback to check whether to autosuspend.
-    callbacks = [AutoResumeCallback(), TimeoutTerminateCallback()]
+    callbacks = [AutoResumeCallback(), TimeoutTerminateCallback(
+        total_time_limit=training_args.total_time_limit if training_args.total_time_limit > 0 else 10**9
+    )]
 
     if training_args.dpo:
         ref_model = model_cls(
