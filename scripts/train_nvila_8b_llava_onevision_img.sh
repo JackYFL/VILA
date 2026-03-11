@@ -70,6 +70,7 @@ torchrun \
     --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
     llava/train/train_mem.py \
         --deepspeed scripts/zero2_gradient_clipping.json \
+        --total_time_limit -1 \
         --model_name_or_path ${MODEL_PATH} \
         --data_mixture "${DATA_MIXTURE}" \
         --vision_tower Efficient-Large-Model/paligemma-siglip-so400m-patch14-448 \
@@ -103,6 +104,6 @@ torchrun \
         --logging_steps 1 \
         --model_max_length 8192 \
         --gradient_checkpointing True \
-        --dataloader_num_workers 16 \
+        --dataloader_num_workers 8 \
         --vflan_no_system_prompt True \
         --report_to wandb
