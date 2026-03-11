@@ -1,0 +1,2 @@
+python download_llava_video_178k.py --output_dir ./LLaVA-Video-178K --num_workers 16
+python preprocess_llava_video_178k.py --input_dir ./LLaVA-Video-178K --output_dir ./LLaVA-Video-178K-processed --num_workers 16
