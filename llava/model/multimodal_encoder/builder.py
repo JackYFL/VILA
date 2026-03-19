@@ -22,7 +22,6 @@ from transformers import AutoConfig, PretrainedConfig, PreTrainedModel
 
 from .clip_encoder import CLIPVisionTower, CLIPVisionTowerS2
 from .intern_encoder import InternVisionTower, InternVisionTowerS2
-from .ps3_encoder import PS3VisionTower
 from .radio_encoder import RADIOVisionTower
 from .siglip_encoder import SiglipVisionTower, SiglipVisionTowerDynamicS2, SiglipVisionTowerS2
 
@@ -43,6 +42,13 @@ def build_vision_tower(model_name_or_path: str, config: PretrainedConfig) -> Pre
     use_dynamic_s2 = getattr(config, "dynamic_s2", False)
 
     if config.ps3:
+        try:
+            from .ps3_encoder import PS3VisionTower
+        except ImportError as e:
+            raise ImportError(
+                "PS3 is enabled but dependency 'ps3' is not installed. "
+                "Install it with `pip install ps3` or disable --ps3."
+            ) from e
         vision_tower = PS3VisionTower(model_name_or_path, config)
     elif "intern" in vision_tower_name.lower():
         drop_path_rate = getattr(config, "drop_path_rate", 0.0)

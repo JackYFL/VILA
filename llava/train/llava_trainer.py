@@ -16,6 +16,7 @@
 # This file is modified from https://github.com/haotian-liu/LLaVA/
 
 
+import contextlib
 import json
 import os
 import random
@@ -34,6 +35,25 @@ from transformers.trainer import get_parameter_names, has_length, is_sagemaker_m
 
 from llava.train.sequence_parallel import get_pg_manager
 from llava.trl.trainer import DPOTrainer
+
+
+@contextlib.contextmanager
+def deterministic_model(model: nn.Module):
+    """Keep top-level model.training=True (for VILA's distributed all_gather checks),
+    while setting all submodules to eval to disable any stochastic behavior
+    (nn.Dropout instances, F.dropout calls, BatchNorm batch stats, etc.)."""
+    # Save and disable all *children* modules (skip the top-level model itself)
+    saved = {name: module.training for name, module in model.named_modules() if name}
+    for name, module in model.named_modules():
+        if name:  # skip top-level: model.training must stay True
+            module.training = False
+    try:
+        yield
+    finally:
+        for name, module in model.named_modules():
+            if name in saved:
+                module.training = saved[name]
+
 
 
 def maybe_zero_3(param, ignore_status=False, name=None):
@@ -439,6 +459,14 @@ class LengthGroupedSampler(Sampler):
 
 
 class VILADPOTrainer(DPOTrainer):
+    def __init__(self, *args, **kwargs):
+        if _DPO_IMPORT_ERROR is not None:
+            raise ImportError(
+                "Failed to import DPOTrainer. If you are not using DPO, keep --dpo False. "
+                "If you need DPO, fix TRL/W&B dependencies."
+            ) from _DPO_IMPORT_ERROR
+        super().__init__(*args, **kwargs)
+
     def _get_train_sampler(self) -> Optional[torch.utils.data.Sampler]:
         if self.train_dataset is None or not has_length(self.train_dataset):
             return None
@@ -663,6 +691,34 @@ class LLaVATrainer(Trainer):
         # we enforce using the batch size specified in the training arguments.
         batch_size = self.args.train_batch_size
         return super()._inner_training_loop(batch_size, *args, **kwargs)
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        if num_items_in_batch is not None:
+            num_items_in_batch_tensor = torch.tensor(num_items_in_batch, device=self.args.device)
+            num_items_in_batch = int(self.accelerator.gather(num_items_in_batch_tensor).sum().cpu())
+        if self.model_accepts_loss_kwargs:
+            loss_kwargs = {}
+            if num_items_in_batch is not None:
+                loss_kwargs["num_items_in_batch"] = num_items_in_batch
+            inputs = {**inputs, **loss_kwargs}
+        stage_type = getattr(self.args, "stage_type", None)
+        if stage_type is not None:
+            stage_type = stage_type.lower()
+        if stage_type == "stage1":
+            outputs = model(**inputs, output_attentions=True)
+            loss = torch.tensor(0.0, device=self.args.device, dtype=torch.float32)
+        else:
+            outputs = model(**inputs)
+            loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
+
+        if stage_type == "stage1" and outputs.attentions is not None:
+            # Each element is a scalar distill loss computed inside the checkpointed
+            # decoder layer forward, so it retains grad_fn even with gradient checkpointing.
+            layer_losses = [a for a in outputs.attentions if isinstance(a, torch.Tensor) and a.ndim == 0]
+            if layer_losses:
+                loss = sum(layer_losses) / len(layer_losses)
+
+        return (loss, outputs) if return_outputs else loss
 
     def create_optimizer(self):
         """

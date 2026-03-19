@@ -109,7 +109,7 @@ class LlavaLlamaModel(LlavaMetaModel, LlavaMetaForCausalLM, PreTrainedModel):
         **kwargs,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         self.freezed_module_patch()
-
+        # import ipdb; ipdb.set_trace()
         if images is not None:
             if media is not None:
                 raise ValueError("Both 'media' and 'images' are provided. Please provide only one.")

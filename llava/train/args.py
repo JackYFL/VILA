@@ -251,6 +251,13 @@ class TrainingArguments(transformers.TrainingArguments):
     lora_llm: bool = False
     lora_vt: bool = False
     dpo: bool = False
+    stage_type: str = field(
+        default="default",
+        metadata={"help": "Training stage type. Set to 'stage1' to train attention parameters only."},
+    )
+    distill_enable: bool = False
+    teacher_model_name_or_path: Optional[str] = field(default=None)
+    distill_temperature: float = field(default=1.0)
     use_one_logger: bool = False
     longvila_sampler: bool = False
     dpo_beta: float = field(default=0.1)

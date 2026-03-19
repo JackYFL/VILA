@@ -26,6 +26,11 @@ import torch
 import transformers
 from torch.utils.data import Dataset
 from transformers import AutoConfig, AutoTokenizer, HfArgumentParser, LlamaForCausalLM, set_seed
+from transformers.integrations.deepspeed import (
+    is_deepspeed_zero3_enabled,
+    set_hf_deepspeed_config,
+    unset_hf_deepspeed_config,
+)
 from transformers.modeling_utils import unwrap_model
 from transformers.utils import logging
 
@@ -38,6 +43,7 @@ from llava.mm_utils import process_image
 from llava.model import LlavaLlamaConfig, LlavaLlamaModel, LlavaTopDownLlamaConfig, LlavaTopDownLlamaModel
 from llava.model.language_model.fp8linearqwen2 import Qwen2ForCausalLM  # We need this line to register AutoConfig
 from llava.model.language_model.qllava_qllama import QLlavaLlamaModel, quantize_args_to_model_class
+from llava.train.linear_attn import ParallelLinearAdapter, LizardAttention, apply_linear_attn_monkey_patches
 from llava.train.args import DataArguments, ModelArguments, TrainingArguments
 from llava.train.callbacks.autoresume_callback import AutoResumeCallback
 from llava.train.llava_trainer import LLaVATopDownTrainer, LLaVATrainer, VILADPOTrainer
@@ -554,6 +560,7 @@ def train():
     if training_args.use_one_logger:
         one_logger_callback_utils.on_model_init_start()
 
+    # import ipdb; ipdb.set_trace()
     if model_args.quantize_model in quantize_args_to_model_class.keys():
         model = model_cls(
             config=config,
@@ -827,6 +834,55 @@ def train():
     callbacks = [AutoResumeCallback(), TimeoutTerminateCallback(
         total_time_limit=training_args.total_time_limit if training_args.total_time_limit > 0 else 10**9
     )]
+    if training_args.distill_enable:
+        stage_type = getattr(training_args, "stage_type", "default").lower()
+        if stage_type == "stage1":
+            mprint("Applying stage1 training policy: monkey-patch self_attn with LizardAttention.")
+
+            # Patch Qwen2DecoderLayer.forward and Qwen2ForCausalLM.forward for stage1 output
+            apply_linear_attn_monkey_patches()
+
+            # Step 1: freeze the entire model
+            model.requires_grad_(False)
+
+            llm = model.get_llm()
+            if llm is None:
+                raise ValueError(
+                    "stage1 requires a language model, but model.get_llm() returned None."
+                )
+
+            # Step 2: replace self_attn in every decoder layer with LizardAttention
+            llm_model = getattr(llm, "model", llm)
+            layers = getattr(llm_model, "layers", None)
+            if layers is None:
+                raise ValueError("stage1: cannot find .model.layers in the LLM.")
+
+            patched_count = 0
+            for layer in layers:
+                if not hasattr(layer, "self_attn"):
+                    continue
+                layer.self_attn = LizardAttention(layer.self_attn)
+                patched_count += 1
+
+            if patched_count == 0:
+                raise ValueError("stage1: no self_attn modules found to patch.")
+
+            mprint(f"stage1: patched {patched_count} self_attn modules with LizardAttention.")
+
+            mprint(f"stage1: tuned modules include:")
+            # import ipdb; ipdb.set_trace()
+            # Step 3: count and log trainable parameters
+            for name, module in model.named_modules():
+                trainable = [p for p in module.parameters(recurse=False) if p.requires_grad]
+                if trainable:
+                    mprint(name, type(module).__name__)
+            trainable_params, all_param = get_nb_trainable_parameters(model)
+            mprint(
+                f"stage1 trainable params: {trainable_params:,d} || "
+                f"all params: {all_param:,d} || "
+                f"trainable%: {100 * trainable_params / all_param:.4f}"
+            )
+
 
     if training_args.dpo:
         assert not model_args.ps3, "DPO is not supported for PS3"
@@ -866,11 +922,19 @@ def train():
         if training_args.use_one_logger:
             newLLaVATrainer = hook_trainer_cls(trainer_cls, one_logger_callback_utils=one_logger_callback_utils)
             trainer = newLLaVATrainer(
-                model=model, tokenizer=tokenizer, args=training_args, callbacks=callbacks, **data_module
+                model=model,
+                tokenizer=tokenizer,
+                args=training_args,
+                callbacks=callbacks,
+                **data_module,
             )
         else:
             trainer = trainer_cls(
-                model=model, tokenizer=tokenizer, args=training_args, callbacks=callbacks, **data_module
+                model=model,
+                tokenizer=tokenizer,
+                args=training_args,
+                callbacks=callbacks,
+                **data_module,
             )
 
         if model_args.quantize_model in ["fp8Activation_qwen2", "fp8ActivationResidual_qwen2"]:
