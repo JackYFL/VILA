@@ -707,16 +707,19 @@ class LLaVATrainer(Trainer):
         if stage_type == "stage1":
             outputs = model(**inputs, output_attentions=True)
             loss = torch.tensor(0.0, device=self.args.device, dtype=torch.float32)
+            # Each element is a scalar distill loss computed inside the checkpointed
+            # decoder layer forward, so it retains grad_fn even with gradient checkpointing.
+            if outputs.attentions is not None:
+                layer_losses = [a for a in outputs.attentions if isinstance(a, torch.Tensor) and a.ndim == 0]
+                if layer_losses:
+                    loss = sum(layer_losses) / len(layer_losses)
+        elif stage_type == "stage2":
+            # Standard token-prediction (CE) loss; no distillation.
+            outputs = model(**inputs)
+            loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
         else:
             outputs = model(**inputs)
             loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
-
-        if stage_type == "stage1" and outputs.attentions is not None:
-            # Each element is a scalar distill loss computed inside the checkpointed
-            # decoder layer forward, so it retains grad_fn even with gradient checkpointing.
-            layer_losses = [a for a in outputs.attentions if isinstance(a, torch.Tensor) and a.ndim == 0]
-            if layer_losses:
-                loss = sum(layer_losses) / len(layer_losses)
 
         return (loss, outputs) if return_outputs else loss
 
