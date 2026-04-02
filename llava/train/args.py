@@ -255,6 +255,20 @@ class TrainingArguments(transformers.TrainingArguments):
         default="default",
         metadata={"help": "Training stage type. Set to 'stage1' to train attention parameters only."},
     )
+    attention_type: str = field(
+        default="softmax",
+        metadata={
+            "help": (
+                "Attention implementation to use when stage_type='stage2'. "
+                "'softmax' keeps the original attention. "
+                "'lizard' replaces every self_attn with LizardAttention (linear attention)."
+            )
+        },
+    )
+    stage1_checkpoint_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "Path to stage1 checkpoint directory for stage2 training."},
+    )
     distill_enable: bool = False
     teacher_model_name_or_path: Optional[str] = field(default=None)
     distill_temperature: float = field(default=1.0)

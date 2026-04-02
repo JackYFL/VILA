@@ -152,6 +152,31 @@ def get_mm_adapter_state_maybe_zero_3(named_params, keys_to_match):
     return to_return
 
 
+def _load_checkpoint_state_dict(checkpoint_dir: str) -> dict:
+    """Load state dict from a checkpoint directory (safetensors shards or pytorch_model.bin)."""
+    import glob as _glob
+
+    try:
+        from safetensors.torch import load_file
+        shards = sorted(_glob.glob(os.path.join(checkpoint_dir, "model*.safetensors")))
+        if shards:
+            state_dict = {}
+            for shard in shards:
+                state_dict.update(load_file(shard, device="cpu"))
+            return state_dict
+    except ImportError:
+        pass
+
+    shards = sorted(_glob.glob(os.path.join(checkpoint_dir, "pytorch_model*.bin")))
+    if shards:
+        state_dict = {}
+        for shard in shards:
+            state_dict.update(torch.load(shard, map_location="cpu"))
+        return state_dict
+
+    raise ValueError(f"No model checkpoint found in {checkpoint_dir}")
+
+
 def find_all_linear_names(model, lora_llm, lora_vt):
     cls = torch.nn.Linear
     lora_module_names = set()
@@ -651,6 +676,74 @@ def train():
                 output.requires_grad_(True)
 
             model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
+
+    # Stage2: optionally replace self-attn, load stage1 weights, then apply LoRA for SFT.
+    # Which attention implementation to swap in is controlled by training_args.attention_type.
+    stage_type_str = getattr(training_args, "stage_type", "default").lower()
+    if stage_type_str == "stage2":
+        attention_type = getattr(training_args, "attention_type", "softmax").lower()
+        mprint(f"Applying stage2 training policy: attention_type={attention_type}, load stage1 weights, apply LoRA for SFT.")
+
+        # Build a registry so new attention types can be added without touching this block.
+        _ATTENTION_REGISTRY = {
+            "lizard": LizardAttention,
+        }
+
+        if attention_type not in ("softmax", "default") and attention_type not in _ATTENTION_REGISTRY:
+            raise ValueError(
+                f"stage2: unknown attention_type '{attention_type}'. "
+                f"Supported values: 'softmax' (no replacement) or one of {list(_ATTENTION_REGISTRY)}."
+            )
+
+        # Step 1: replace every decoder layer's self_attn with the chosen implementation.
+        if attention_type in _ATTENTION_REGISTRY:
+            attn_cls = _ATTENTION_REGISTRY[attention_type]
+
+            if attention_type == "lizard":
+                # Patch decoder-layer forward to handle LizardAttention's 2-tuple return.
+                apply_linear_attn_monkey_patches()
+
+            llm = model.get_llm()
+            if llm is None:
+                raise ValueError("stage2 requires a language model, but model.get_llm() returned None.")
+            llm_model = getattr(llm, "model", llm)
+            layers = getattr(llm_model, "layers", None)
+            if layers is None:
+                raise ValueError("stage2: cannot find .model.layers in the LLM.")
+
+            patched_count = 0
+            for layer in layers:
+                if not hasattr(layer, "self_attn"):
+                    continue
+                layer.self_attn = attn_cls(layer.self_attn)
+                patched_count += 1
+            if patched_count == 0:
+                raise ValueError(f"stage2: no self_attn modules found to patch with {attn_cls.__name__}.")
+            mprint(f"stage2: patched {patched_count} self_attn modules with {attn_cls.__name__}.")
+        else:
+            mprint("stage2: attention_type='softmax', keeping original self_attn unchanged.")
+
+        # Step 2: load stage1 checkpoint (brings in trained attention adapter weights).
+        stage1_ckpt = getattr(training_args, "stage1_checkpoint_path", None)
+        if stage1_ckpt:
+            mprint(f"stage2: loading stage1 weights from {stage1_ckpt}")
+            ckpt_state_dict = _load_checkpoint_state_dict(stage1_ckpt)
+            missing_keys, unexpected_keys = model.load_state_dict(ckpt_state_dict, strict=False)
+            mprint(
+                f"stage2: loaded stage1 weights. "
+                f"Missing keys: {len(missing_keys)}, Unexpected keys: {len(unexpected_keys)}"
+            )
+        else:
+            mprint("stage2: no stage1_checkpoint_path provided; using freshly initialized attention weights.")
+
+        # Step 3: LoRA will be applied below by the existing lora_enable block.
+        mprint("stage2: LoRA for SFT will be applied via lora_enable below.")
+        trainable_params, all_param = get_nb_trainable_parameters(model)
+        mprint(
+            f"stage2 (before LoRA) trainable params: {trainable_params:,d} || "
+            f"all params: {all_param:,d} || "
+            f"trainable%: {100 * trainable_params / all_param:.4f}"
+        )
 
     if training_args.lora_enable:
         from peft import LoraConfig, PeftModel, get_peft_model
