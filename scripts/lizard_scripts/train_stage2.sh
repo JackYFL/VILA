@@ -10,7 +10,7 @@ set -e
 # Configurable parameters (override via env vars)
 # ============================================================
 DEFAULT_RUN_NAME="nvila-8b-llava-onevision-img-stage2"
-DEFAULT_PER_DEVICE_TRAIN_BATCH_SIZE=8
+DEFAULT_PER_DEVICE_TRAIN_BATCH_SIZE=6
 DEFAULT_GRADIENT_ACCUMULATION_STEPS=4
 DEFAULT_LORA_R=64
 DEFAULT_LORA_ALPHA=16
@@ -20,7 +20,7 @@ DEFAULT_LORA_DROPOUT=0.05
 MODEL_PATH=${MODEL_PATH:-"Efficient-Large-Model/NVILA-8B"}
 
 # Stage1 checkpoint to load LizardAttention weights from
-STAGE1_CHECKPOINT_PATH=${STAGE1_CHECKPOINT_PATH:-"runs/train/nvila-8b-llava-onevision-img-stage1/model"}
+STAGE1_CHECKPOINT_PATH=${STAGE1_CHECKPOINT_PATH:-"runs/train/nvila-8b-llava-onevision-img-stage1/model/checkpoint-1500"}
 
 # Dataset paths
 DATA_ROOT="/mnt/localssd/data"

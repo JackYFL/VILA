@@ -8,7 +8,7 @@ set -e
 # Configurable parameters (override via env vars)
 # ============================================================
 DEFAULT_RUN_NAME="nvila-8b-llava-onevision-img-stage1"
-DEFAULT_PER_DEVICE_TRAIN_BATCH_SIZE=8
+DEFAULT_PER_DEVICE_TRAIN_BATCH_SIZE=7
 DEFAULT_GRADIENT_ACCUMULATION_STEPS=4
 DEFAULT_LORA_R=64
 DEFAULT_LORA_ALPHA=16

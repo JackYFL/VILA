@@ -152,31 +152,6 @@ def get_mm_adapter_state_maybe_zero_3(named_params, keys_to_match):
     return to_return
 
 
-def _load_checkpoint_state_dict(checkpoint_dir: str) -> dict:
-    """Load state dict from a checkpoint directory (safetensors shards or pytorch_model.bin)."""
-    import glob as _glob
-
-    try:
-        from safetensors.torch import load_file
-        shards = sorted(_glob.glob(os.path.join(checkpoint_dir, "model*.safetensors")))
-        if shards:
-            state_dict = {}
-            for shard in shards:
-                state_dict.update(load_file(shard, device="cpu"))
-            return state_dict
-    except ImportError:
-        pass
-
-    shards = sorted(_glob.glob(os.path.join(checkpoint_dir, "pytorch_model*.bin")))
-    if shards:
-        state_dict = {}
-        for shard in shards:
-            state_dict.update(torch.load(shard, map_location="cpu"))
-        return state_dict
-
-    raise ValueError(f"No model checkpoint found in {checkpoint_dir}")
-
-
 def find_all_linear_names(model, lora_llm, lora_vt):
     cls = torch.nn.Linear
     lora_module_names = set()
@@ -723,15 +698,48 @@ def train():
         else:
             mprint("stage2: attention_type='softmax', keeping original self_attn unchanged.")
 
-        # Step 2: load stage1 checkpoint (brings in trained attention adapter weights).
+        # Step 2: load stage1 checkpoint (brings in trained LizardAttention adapter weights).
+        # Under DeepSpeed ZeRO-3, original q/k/v/o_proj weights are partitioned (shape [0]),
+        # but those weights were FROZEN in stage1 and are identical to the base model — no
+        # need to reload them. We only need the newly trained LizardAttention params:
+        # feature_map_q, feature_map_k, gated_proj — which have full shapes because they
+        # were created after ZeRO-3 model init.
         stage1_ckpt = getattr(training_args, "stage1_checkpoint_path", None)
         if stage1_ckpt:
-            mprint(f"stage2: loading stage1 weights from {stage1_ckpt}")
-            ckpt_state_dict = _load_checkpoint_state_dict(stage1_ckpt)
-            missing_keys, unexpected_keys = model.load_state_dict(ckpt_state_dict, strict=False)
+            import glob as _glob
+
+            # Resolve the directory that contains HF-style safetensors/bin files.
+            # VILA DeepSpeed checkpoints store the consolidated LLM under a `llm/` subdir.
+            _llm_subdir = os.path.join(stage1_ckpt, "llm")
+            _ckpt_dir = _llm_subdir if os.path.isdir(_llm_subdir) else stage1_ckpt
+            mprint(f"stage2: loading LizardAttention weights from {_ckpt_dir}")
+
+            # Collect all shard files into a flat state dict.
+            _ckpt_state_dict = {}
+            _st_shards = sorted(_glob.glob(os.path.join(_ckpt_dir, "model*.safetensors")))
+            if _st_shards:
+                from safetensors.torch import load_file as _st_load
+                for _shard in _st_shards:
+                    _ckpt_state_dict.update(_st_load(_shard, device="cpu"))
+            else:
+                _bin_shards = sorted(_glob.glob(os.path.join(_ckpt_dir, "pytorch_model*.bin")))
+                for _shard in _bin_shards:
+                    _ckpt_state_dict.update(torch.load(_shard, map_location="cpu"))
+
+            if not _ckpt_state_dict:
+                raise ValueError(f"stage2: no model weights found in {_ckpt_dir}")
+
+            # Keep only the LizardAttention-specific keys (newly created, full-shape tensors).
+            # Skipping q/k/v/o_proj avoids ZeRO-3 size-mismatch errors and is correct
+            # because those weights were frozen in stage1 (unchanged from the base model).
+            _lizard_keys = ("feature_map_q.", "feature_map_k.", "gated_proj.")
+            _adapter_dict = {k: v for k, v in _ckpt_state_dict.items()
+                             if any(lk in k for lk in _lizard_keys)}
+
+            missing, unexpected = model.get_llm().load_state_dict(_adapter_dict, strict=False)
             mprint(
-                f"stage2: loaded stage1 weights. "
-                f"Missing keys: {len(missing_keys)}, Unexpected keys: {len(unexpected_keys)}"
+                f"stage2: loaded {len(_adapter_dict)} LizardAttention weight tensors "
+                f"(missing: {len(missing)}, unexpected: {len(unexpected)})."
             )
         else:
             mprint("stage2: no stage1_checkpoint_path provided; using freshly initialized attention weights.")
