@@ -35,3 +35,42 @@ cp -rv ./llava/train/deepspeed_replace/* $site_pkg_path/deepspeed/
 
 # Downgrade protobuf to 3.20 for backward compatibility
 pip install protobuf==3.20.*
+
+# Upgrade PyTorch to 2.5.1+cu124 (required for flash-linear-attention 0.4.2 compatibility)
+pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu124
+
+# Install flash-linear-attention
+pip install flash-linear-attention==0.4.2
+
+# Upgrade wandb to fix protobuf import errors caused by the upgrade above
+pip install --upgrade wandb
+
+# Patch flash-linear-attention for Triton 3.1 compatibility
+# Fix 1: @torch.compile incorrectly applied to torch.autograd.Function subclasses
+python - <<'EOF'
+import re, pathlib, site
+sp = site.getsitepackages()[0]
+for fname in ['fla/ops/attn/parallel.py', 'fla/ops/nsa/parallel.py']:
+    p = pathlib.Path(sp) / fname
+    if not p.exists():
+        continue
+    txt = p.read_text()
+    new_txt = re.sub(r'@torch\.compile\n(class \w+\(torch\.autograd\.Function\))', r'\1', txt)
+    if new_txt != txt:
+        p.write_text(new_txt)
+        print(f'Patched: {fname}')
+EOF
+
+# Fix 2: triton autotuner crashes on unknown autotune keys (e.g. STAGE, BT not in kernel args)
+python - <<'EOF'
+import pathlib, site
+p = pathlib.Path(site.getsitepackages()[0]) / 'triton/runtime/autotuner.py'
+if p.exists():
+    txt = p.read_text()
+    old = 'self.key_idx = [arg_names.index(k) for k in key]'
+    new = 'self.key_idx = [arg_names.index(k) for k in key if k in arg_names]'
+    if old in txt:
+        p.write_text(txt.replace(old, new))
+        print('Patched: triton/runtime/autotuner.py')
+EOF
+

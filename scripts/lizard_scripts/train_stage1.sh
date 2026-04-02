@@ -7,7 +7,7 @@ set -e
 # ============================================================
 # Configurable parameters (override via env vars)
 # ============================================================
-DEFAULT_RUN_NAME="nvila-8b-llava-onevision-img-test"
+DEFAULT_RUN_NAME="nvila-8b-llava-onevision-img-stage1"
 DEFAULT_PER_DEVICE_TRAIN_BATCH_SIZE=8
 DEFAULT_GRADIENT_ACCUMULATION_STEPS=4
 DEFAULT_LORA_R=64
@@ -19,7 +19,7 @@ MODEL_PATH=${MODEL_PATH:-"Efficient-Large-Model/NVILA-8B"}
 TEACHER_MODEL_PATH=${TEACHER_MODEL_PATH:-"${MODEL_PATH}"}
 
 # Dataset paths
-DATA_ROOT="/mnt/localssd/datasets"
+DATA_ROOT="/mnt/localssd/data"
 METADATA_DIR="${DATA_ROOT}/LLaVA-OneVision-Data-processed/metadata"
 
 # ============================================================
