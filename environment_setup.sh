@@ -62,15 +62,25 @@ for fname in ['fla/ops/attn/parallel.py', 'fla/ops/nsa/parallel.py']:
 EOF
 
 # Fix 2: triton autotuner crashes on unknown autotune keys (e.g. STAGE, BT not in kernel args)
+# Also fixes IndexError at runtime when _args is a subset of arg_names
 python - <<'EOF'
 import pathlib, site
 p = pathlib.Path(site.getsitepackages()[0]) / 'triton/runtime/autotuner.py'
 if p.exists():
     txt = p.read_text()
-    old = 'self.key_idx = [arg_names.index(k) for k in key]'
-    new = 'self.key_idx = [arg_names.index(k) for k in key if k in arg_names]'
-    if old in txt:
-        p.write_text(txt.replace(old, new))
+    patched = False
+    old1 = 'self.key_idx = [arg_names.index(k) for k in key]'
+    new1 = 'self.key_idx = [arg_names.index(k) for k in key if k in arg_names]'
+    if old1 in txt:
+        txt = txt.replace(old1, new1)
+        patched = True
+    old2 = 'key = [_args[i] for i in self.key_idx]'
+    new2 = 'key = [all_args[self.arg_names[i]] for i in self.key_idx if self.arg_names[i] in all_args]'
+    if old2 in txt:
+        txt = txt.replace(old2, new2)
+        patched = True
+    if patched:
+        p.write_text(txt)
         print('Patched: triton/runtime/autotuner.py')
 EOF
 
