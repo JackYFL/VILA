@@ -9,7 +9,7 @@ set -e
 # ============================================================
 # Configurable parameters (override via env vars)
 # ============================================================
-DEFAULT_RUN_NAME="nvila-8b-llava-onevision-img-stage2"
+DEFAULT_RUN_NAME="nvila-8b-llava-onevision-img-stage2-new"
 DEFAULT_PER_DEVICE_TRAIN_BATCH_SIZE=6
 DEFAULT_GRADIENT_ACCUMULATION_STEPS=4
 DEFAULT_LORA_R=64
@@ -96,12 +96,13 @@ export WANDB_DIR=${WANDB_DIR:-"${OUTPUT_DIR}"}
 export WANDB_RUN_ID=${WANDB_RUN_ID:-"${RUN_NAME}"}
 export WANDB_NAME=${WANDB_NAME:-"${RUN_NAME}"}
 export WANDB_RESUME=${WANDB_RESUME:-"allow"}
+export RUN_NAME  # train.py reads RUN_NAME env var and uses it as run_name (overrides output_dir basename)
 
 export NCCL_IB_TIMEOUT=60
 export TORCH_NCCL_BLOCKING_WAIT=0
 export TOKENIZERS_PARALLELISM=false
 
-mkdir -p "${OUTPUT_DIR}/model"
+mkdir -p "${OUTPUT_DIR}"
 
 echo "MODEL_PATH           = ${MODEL_PATH}"
 echo "STAGE1_CHECKPOINT    = ${STAGE1_CHECKPOINT_PATH}"
