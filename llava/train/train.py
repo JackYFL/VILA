@@ -43,7 +43,7 @@ from llava.mm_utils import process_image
 from llava.model import LlavaLlamaConfig, LlavaLlamaModel, LlavaTopDownLlamaConfig, LlavaTopDownLlamaModel
 from llava.model.language_model.fp8linearqwen2 import Qwen2ForCausalLM  # We need this line to register AutoConfig
 from llava.model.language_model.qllava_qllama import QLlavaLlamaModel, quantize_args_to_model_class
-from llava.train.linear_attn import ParallelLinearAdapter, LizardAttention, apply_linear_attn_monkey_patches
+from llava.train.linear_attn import ParallelLinearAdapter, LizardAttention, LinearGatedCache, apply_linear_attn_monkey_patches
 from llava.train.args import DataArguments, ModelArguments, TrainingArguments
 from llava.train.callbacks.autoresume_callback import AutoResumeCallback
 from llava.train.llava_trainer import LLaVATopDownTrainer, LLaVATrainer, VILADPOTrainer

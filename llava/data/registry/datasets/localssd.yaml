@@ -1,0 +1,7 @@
+# Dataset registry pointing to /mnt/localssd/data/eval downloads
+# Usage: export VILA_DATASETS=localssd
+
+textvqa:
+    data_path:   /mnt/localssd/data/eval/textvqa/annotations/TextVQA_0.5.1_val.json
+    image_dir:   /mnt/localssd/data/eval/textvqa/train_images
+    answer_path: /mnt/localssd/data/eval/textvqa/annotations/TextVQA_0.5.1_val.json

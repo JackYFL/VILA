@@ -5,6 +5,7 @@ import torch.nn.functional as F
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from .lizard_attn import LizardAttention
+from .lizard_cache import LinearGatedCache
 
 _original_causal_lm_forward = None  # saved before patching
 
@@ -36,14 +37,20 @@ def patched_decoder_layer_forward(
     )
 
     if isinstance(self.self_attn, LizardAttention):
-        # LizardAttention returns (attn_output, (linear_attn_output, softmax_attn_output))
+        # LizardAttention returns:
+        #   training:  (attn_output, (linear_out, softmax_out), None)
+        #   inference: (attn_output, None,                      cache)
         hidden_states = attn_result[0]
-        linear_out, softmax_out = attn_result[1]
-        present_key_value = None  # no KV cache for linear attention
+        attn_info = attn_result[1]          # (linear_out, softmax_out) or None
+        present_key_value = attn_result[2] if len(attn_result) >= 3 else None
         # Compute distill loss INSIDE the checkpointed region so gradient checkpointing
         # can recompute it with grad_fn during backward. Store as scalar tensor.
-        if output_attentions and softmax_out is not None:
-            self_attn_weights = F.l1_loss(linear_out.float(), softmax_out.float())
+        if isinstance(attn_info, tuple):
+            linear_out, softmax_out = attn_info
+            if output_attentions and softmax_out is not None:
+                self_attn_weights = F.l1_loss(linear_out.float(), softmax_out.float())
+            else:
+                self_attn_weights = None
         else:
             self_attn_weights = None
     else:
@@ -84,6 +91,17 @@ def patched_causal_lm_forward(
     stage_type=None,
     **loss_kwargs,
 ):
+    # Replace DynamicCache with LinearGatedCache for LizardAttention inference.
+    # Qwen2Model.forward creates DynamicCache() when past_key_values is None and
+    # use_cache=True.  Since LinearGatedCache extends Cache, injecting it here causes
+    # Qwen2Model to skip that creation (guard: `not isinstance(past_key_values, Cache)`).
+    _use_cache = use_cache if use_cache is not None else self.config.use_cache
+    if _use_cache and past_key_values is None and not self.training:
+        _inner = getattr(self.model, "model", self.model)
+        _layers = getattr(_inner, "layers", None)
+        if _layers and isinstance(getattr(_layers[0], "self_attn", None), LizardAttention):
+            past_key_values = LinearGatedCache()
+
     # stage_type=None: delegate to original Qwen2ForCausalLM.forward unchanged
     if stage_type is None:
         return _original_causal_lm_forward(

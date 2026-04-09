@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from flash_attn import flash_attn_func
-from fla.ops.simple_gla import chunk_simple_gla
+from fla.ops.simple_gla import chunk_simple_gla, fused_recurrent_simple_gla
 from transformers.models.llama.modeling_llama import apply_rotary_pos_emb
 
 from llava.train.linear_attn.parallel_adapter import ParallelLinearAdapter
@@ -152,6 +152,57 @@ def linear_fused_gated_attention_func(
     )
 
     return attn_output
+
+
+def linear_fused_gated_attention_func_with_cache(
+    query_states: torch.Tensor,         # (B, L, H_q, K_feat)  seq-first
+    key_states: torch.Tensor,           # (B, L, H_k, K_feat)  seq-first
+    value_states: torch.Tensor,         # (B, L, H_k, V)       seq-first
+    log_gates: torch.Tensor,            # (B, L, H_k)
+    num_key_value_groups: int,
+    past_hidden_state: Optional[torch.Tensor],  # (B, H_q, K_feat, V) or None
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Cache-aware GLA forward.  Dispatches to:
+      - fused_recurrent_simple_gla  for single-token generation (L == 1)
+      - chunk_simple_gla            for multi-token prefill     (L  > 1)
+    Both called with output_final_state=True to capture h_final for caching.
+
+    Returns:
+        attn_output:  (B, L, H_q, V)       seq-first
+        final_state:  (B, H_q, K_feat, V)
+    """
+    # GQA expansion
+    key_states   = repeat_kv(key_states,   num_key_value_groups, head_first=False)
+    value_states = repeat_kv(value_states, num_key_value_groups, head_first=False)
+    log_gates    = repeat_kv(
+        log_gates[:, :, :, None], num_key_value_groups, head_first=False
+    ).squeeze(-1)
+
+    seq_len = query_states.shape[1]
+
+    if seq_len == 1:
+        attn_output, final_state = fused_recurrent_simple_gla(
+            q=query_states,
+            k=key_states,
+            v=value_states,
+            g=log_gates,
+            scale=1.0,
+            initial_state=past_hidden_state,
+            output_final_state=True,
+        )
+    else:
+        attn_output, final_state = chunk_simple_gla(
+            q=query_states,
+            k=key_states,
+            v=value_states,
+            g=log_gates,
+            scale=1.0,
+            initial_state=past_hidden_state,
+            output_final_state=True,
+        )
+
+    return attn_output, final_state
 
 
 # ---------------------------------------------------------------------------
@@ -328,16 +379,32 @@ class LizardAttention(nn.Module):
         key_states   = self.k_proj(hidden_states).view(hidden_shape)   # (B, L, H_k, D)
         value_states = self.v_proj(hidden_states).view(hidden_shape)   # (B, L, H_k, D)
 
-        # Linear gated attention (chunk_simple_gla)
+        # Linear gated attention — branch on cache presence
         # q/k/v are in seq-first format (B,L,H,D); feature_map uses head_first=False
-        linear_attn_output = linear_fused_gated_attention_func(
-            query_states=self.feature_map_q(query_states),
-            key_states=self.feature_map_k(key_states),
-            value_states=value_states,
-            log_gates=log_gates,
-            num_key_value_groups=self.num_key_value_groups,
-            dropout=0.0 if not self.training else self.attention_dropout,
-        )
+        from llava.train.linear_attn.lizard_cache import LinearGatedCache
+
+        if isinstance(past_key_value, LinearGatedCache):
+            # Inference path: cache-aware recurrent kernel
+            past_h = past_key_value.get_hidden_state(self.layer_idx)
+            linear_attn_output, final_h = linear_fused_gated_attention_func_with_cache(
+                query_states=self.feature_map_q(query_states),
+                key_states=self.feature_map_k(key_states),
+                value_states=value_states,
+                log_gates=log_gates,
+                num_key_value_groups=self.num_key_value_groups,
+                past_hidden_state=past_h,
+            )
+            past_key_value.update_hidden_state(final_h, self.layer_idx, seq_len)
+        else:
+            # Training path: original behavior, no cache
+            linear_attn_output = linear_fused_gated_attention_func(
+                query_states=self.feature_map_q(query_states),
+                key_states=self.feature_map_k(key_states),
+                value_states=value_states,
+                log_gates=log_gates,
+                num_key_value_groups=self.num_key_value_groups,
+                dropout=0.0 if not self.training else self.attention_dropout,
+            )
 
         # Optionally compute vanilla softmax attention (use_base_attention=True path).
         # vanilla_rope_attention uses unsqueeze_dim=2 (seq-first), consistent with
@@ -384,4 +451,13 @@ class LizardAttention(nn.Module):
             attn_output = linear_attn_output.reshape(batch_size, seq_len, -1).contiguous()
 
         attn_output = self.o_proj(attn_output)
-        return attn_output, (linear_attn_output, softmax_attn_output)
+
+        # Expose cache for inference; None during training.
+        # During inference the distillation tuple is not needed — return None to
+        # avoid keeping linear_attn_output alive through the return chain.
+        present_key_value = (
+            past_key_value if isinstance(past_key_value, LinearGatedCache) else None
+        )
+        if present_key_value is not None:
+            return attn_output, None, present_key_value
+        return attn_output, (linear_attn_output, softmax_attn_output), present_key_value
