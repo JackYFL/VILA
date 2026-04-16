@@ -2,6 +2,6 @@
 # Usage: export VILA_DATASETS=localssd
 
 textvqa:
-    data_path:   /mnt/localssd/data/eval/textvqa/annotations/TextVQA_0.5.1_val.json
+    data_path:   /mnt/localssd/data/eval/textvqa/annotations/textvqa_val_vila.json
     image_dir:   /mnt/localssd/data/eval/textvqa/train_images
     answer_path: /mnt/localssd/data/eval/textvqa/annotations/TextVQA_0.5.1_val.json
