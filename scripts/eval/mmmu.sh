@@ -24,6 +24,6 @@ torchrun --nproc-per-node=$NPROC_PER_NODE \
     --conv-mode $CONV_MODE \
     --max-tiles $MAX_TILES \
     --generation-config "$GENERATION_CONFIG" \
-    --split test \
+    --split validation \
     --data-path $DATA_PATH \
     --output-dir $OUTPUT_DIR

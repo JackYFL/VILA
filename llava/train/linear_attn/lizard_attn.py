@@ -1,3 +1,5 @@
+import math
+import os
 from typing import Optional, Tuple
 
 import torch
@@ -346,7 +348,11 @@ class LizardAttention(nn.Module):
             head_first=False,
         )
 
-        # New trainable: gate projection
+        # New trainable: gate projection.
+        # Bias is initialized to log(99) ≈ 4.6 so that sigmoid(bias) ≈ 0.99,
+        # giving GLA an effective memory span of ~100 tokens from the start of
+        # stage1 training.  Without this, kaiming-init produces bias≈0 →
+        # g≈0.5 → memory span of ~2 tokens, which forgets all image tokens.
         self.gated_proj = nn.Linear(
             self.hidden_size,
             self.num_key_value_heads,
@@ -354,6 +360,7 @@ class LizardAttention(nn.Module):
             dtype=ref_dtype,
             device=ref_device,
         )
+        nn.init.constant_(self.gated_proj.bias, math.log(99))  # sigmoid(log99)≈0.99
 
         del base_attention_module  # free reference (matches gated_lizard pattern)
 
@@ -373,6 +380,13 @@ class LizardAttention(nn.Module):
         # Gate for linear attention
         gates = self.gated_proj(hidden_states)              # (B, L, num_kv_heads)
         log_gates = F.logsigmoid(gates.float())             # fp32 for numerical stability
+        # Diagnostic: LIZARD_FORCE_GATE=0.99 overrides g to a fixed value, letting
+        # us test whether gate collapse (g≈0.5→2-token memory) is the root cause
+        # without retraining.  Unset (or empty) for normal operation.
+        _force_gate = float(os.environ.get("LIZARD_FORCE_GATE", 0) or 0)
+        if _force_gate > 0:
+            import math
+            log_gates = torch.full_like(log_gates, math.log(_force_gate / (1 - _force_gate)))
 
         hidden_shape = (batch_size, seq_len, -1, self.head_dim)
         query_states = self.q_proj(hidden_states).view(hidden_shape)   # (B, L, H_q, D)
