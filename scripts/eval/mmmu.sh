@@ -1,7 +1,9 @@
 #!/bin/bash
-# Evaluate on MMMU validation set.
+# Evaluate on MMMU validation set (30 subjects, ~900 samples).
 # Usage: bash scripts/eval/mmmu.sh <model_path> <conv_mode> [max_tiles]
 # Example: bash scripts/eval/mmmu.sh Efficient-Large-Model/NVILA-8B hermes-2 12
+#
+# For MMMU-Pro evaluation, use scripts/eval/mmmu_pro.sh instead.
 
 set -e
 
@@ -22,6 +24,6 @@ torchrun --nproc-per-node=$NPROC_PER_NODE \
     --conv-mode $CONV_MODE \
     --max-tiles $MAX_TILES \
     --generation-config "$GENERATION_CONFIG" \
-    --split validation \
+    --split test \
     --data-path $DATA_PATH \
     --output-dir $OUTPUT_DIR

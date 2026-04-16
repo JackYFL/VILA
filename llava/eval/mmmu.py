@@ -25,39 +25,92 @@ MMMU_SUBJECTS = [
     "Music", "Pharmacy", "Physics", "Psychology", "Public_Health", "Sociology",
 ]
 
-CHOICE_LABELS = ["A", "B", "C", "D", "E", "F", "G", "H"]
+# MMMU-Pro configs and their HuggingFace config names
+MMMU_PRO_CONFIGS = [
+    "standard (4 options)",
+    "standard (10 options)",
+    "vision",
+]
+
+CHOICE_LABELS = [chr(ord("A") + i) for i in range(26)]  # A-Z, handles up to 26 options
 
 
-def format_question(instance):
-    """Build the text prompt for a single MMMU sample."""
+def format_question(instance, is_pro=False, is_vision=False):
+    """Build the text prompt for a single MMMU/MMMU-Pro sample."""
+    options = instance["options"]
+    if isinstance(options, str):
+        options = ast.literal_eval(options)
+    choices_text = "\n".join(
+        f"({CHOICE_LABELS[i]}) {opt}" for i, opt in enumerate(options)
+    )
+
+    if is_vision:
+        # Question is baked into the image; just present the answer choices
+        prompt = (
+            f"Options:\n{choices_text}\n"
+            "Answer with the option's letter from the given choices directly."
+        )
+        return prompt
+
     question = instance["question"]
 
-    if instance["question_type"] == "multiple-choice":
-        options = instance["options"]
-        if isinstance(options, str):
-            options = ast.literal_eval(options)
-        choices_text = "\n".join(
-            f"({CHOICE_LABELS[i]}) {opt}" for i, opt in enumerate(options)
-        )
+    if is_pro or instance.get("question_type") == "multiple-choice":
         prompt = (
             f"{question}\n"
             f"Options:\n{choices_text}\n"
             "Answer with the option's letter from the given choices directly."
         )
     else:
+        # Open-ended question (standard MMMU only)
         prompt = f"{question}\nAnswer the question using a single word or phrase."
 
     return prompt
 
 
-def collect_images(instance):
-    """Return list of non-None PIL images from image_1..image_7 fields."""
+def collect_images(instance, is_vision=False):
+    """Return list of non-None PIL images."""
+    if is_vision:
+        # MMMU-Pro vision config has a single 'image' field
+        img = instance.get("image")
+        return [img] if img is not None else []
+    # Standard MMMU / MMMU-Pro standard configs: image_1..image_7
     images = []
     for i in range(1, 8):
         img = instance.get(f"image_{i}")
         if img is not None:
             images.append(img)
     return images
+
+
+def load_mmmu_instances(data_path, split):
+    """Load all standard MMMU instances across 30 subjects."""
+    all_instances = []
+    for subject in MMMU_SUBJECTS:
+        ds = load_dataset(data_path, subject, split=split, trust_remote_code=True)
+        for item in ds:
+            item["subject"] = subject
+            item["_pro"] = False
+            item["_vision"] = False
+            all_instances.append(item)
+    return all_instances
+
+
+def load_mmmu_pro_instances(data_path, configs=None):
+    """Load MMMU-Pro instances for the given configs (default: all three)."""
+    if configs is None:
+        configs = MMMU_PRO_CONFIGS
+    all_instances = []
+    for cfg in configs:
+        is_vision = cfg == "vision"
+        ds = load_dataset(data_path, cfg, split="test", trust_remote_code=True)
+        for idx, item in enumerate(ds):
+            item["_pro"] = True
+            item["_vision"] = is_vision
+            item["_config"] = cfg
+            if "id" not in item:
+                item["id"] = f"{cfg}_{idx}"
+            all_instances.append(item)
+    return all_instances
 
 
 def evaluate_outputs(outputs):
@@ -98,11 +151,23 @@ def main():
     parser.add_argument("--conv-mode", type=str, required=True)
     parser.add_argument("--max-tiles", type=int, default=12)
     parser.add_argument("--generation-config", type=json.loads)
+    parser.add_argument("--output-dir", type=str, required=True)
+
+    # Standard MMMU options
     parser.add_argument("--split", type=str, default="validation",
                         help="HuggingFace split name: validation | dev | test")
     parser.add_argument("--data-path", type=str, default="/mnt/localssd/data/eval/mmmu",
                         help="Local path to MMMU HuggingFace dataset dir")
-    parser.add_argument("--output-dir", type=str, required=True)
+
+    # MMMU-Pro options
+    parser.add_argument("--pro", action="store_true",
+                        help="Evaluate on MMMU-Pro instead of standard MMMU")
+    parser.add_argument("--pro-data-path", type=str, default="/mnt/localssd/data/eval/mmmu_pro",
+                        help="Local path to MMMU-Pro HuggingFace dataset dir")
+    parser.add_argument("--pro-configs", type=str, nargs="+",
+                        default=None,
+                        help="MMMU-Pro configs to run (default: all three). "
+                             "Choices: 'standard (4 options)' 'standard (10 options)' 'vision'")
     args = parser.parse_args()
 
     # Set up distributed environment
@@ -134,13 +199,13 @@ def main():
     if args.generation_config is not None:
         generation_config.update(**args.generation_config)
 
-    # Collect all instances across all 30 subjects
-    all_instances = []
-    for subject in MMMU_SUBJECTS:
-        ds = load_dataset(args.data_path, subject, split=args.split, trust_remote_code=True)
-        for item in ds:
-            item["subject"] = subject
-            all_instances.append(item)
+    # Load instances
+    if args.pro:
+        all_instances = load_mmmu_pro_instances(args.pro_data_path, args.pro_configs)
+        can_evaluate = True  # Pro test split includes answer labels
+    else:
+        all_instances = load_mmmu_instances(args.data_path, args.split)
+        can_evaluate = args.split != "test"
 
     # Chunk for this rank
     instances = all_instances[dist.rank() :: dist.size()]
@@ -148,14 +213,19 @@ def main():
     # Run inference
     outputs = []
     for instance in tqdm(instances, disable=not dist.is_main()):
-        images = collect_images(instance)
-        question = format_question(instance)
+        is_pro = instance.get("_pro", False)
+        is_vision = instance.get("_vision", False)
 
-        # Build content list: interleave images referenced in question, then trailing images
+        images = collect_images(instance, is_vision=is_vision)
+        question = format_question(instance, is_pro=is_pro, is_vision=is_vision)
+
+        # Interleave: images first, then text prompt
         content = images + [question]
         response = model.generate_content(content, generation_config=generation_config)
 
-        if instance["question_type"] == "multiple-choice":
+        # Always multiple-choice for Pro; check question_type for standard MMMU
+        is_mc = is_pro or instance.get("question_type") == "multiple-choice"
+        if is_mc:
             options = instance["options"]
             if isinstance(options, str):
                 options = ast.literal_eval(options)
@@ -165,15 +235,19 @@ def main():
         else:
             pred = response.strip()
 
-        outputs.append({
-            "id": instance["id"],
-            "subject": instance["subject"],
-            "question_type": instance["question_type"],
-            "question": instance["question"],
+        out_item = {
+            "id": instance.get("id", ""),
+            "subject": instance.get("subject", ""),
             "answer": instance["answer"],
             "pred": pred,
             "response": response,
-        })
+        }
+        if is_pro:
+            out_item["config"] = instance.get("_config", "")
+        else:
+            out_item["question_type"] = instance.get("question_type", "")
+            out_item["question"] = instance.get("question", "")
+        outputs.append(out_item)
 
     # Gather outputs across ranks
     if dist.size() > 1:
@@ -185,9 +259,27 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     io.save(os.path.join(args.output_dir, "outputs.jsonl"), outputs)
 
-    # Evaluate (skip for test split which has no labels)
-    if args.split != "test":
+    if can_evaluate:
         metrics = evaluate_outputs(outputs)
+
+        # For MMMU-Pro, also break down by config
+        if args.pro:
+            config_stats = defaultdict(lambda: {"correct": 0, "total": 0})
+            for out in outputs:
+                cfg = out.get("config", "unknown")
+                gt = out["answer"]
+                pred = out["pred"]
+                config_stats[cfg]["correct"] += int(pred == gt)
+                config_stats[cfg]["total"] += 1
+            metrics["config"] = {
+                cfg: {
+                    "accuracy": round(s["correct"] / s["total"] * 100, 2),
+                    "correct": s["correct"],
+                    "total": s["total"],
+                }
+                for cfg, s in sorted(config_stats.items())
+            }
+
         io.save(os.path.join(args.output_dir, "metrics.json"), metrics)
         logger.info(f"Metrics: {metrics}")
 
