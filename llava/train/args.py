@@ -259,9 +259,10 @@ class TrainingArguments(transformers.TrainingArguments):
         default="softmax",
         metadata={
             "help": (
-                "Attention implementation to use when stage_type='stage2'. "
-                "'softmax' keeps the original attention. "
-                "'lizard' replaces every self_attn with LizardAttention (linear attention)."
+                "Attention implementation for linear-attention training stages. "
+                "For stage1, 'lizard' and 'linear_attn' select which self_attn module is distilled. "
+                "For stage2, 'softmax' keeps the original attention, while 'lizard' or "
+                "'linear_attn' replaces every self_attn with the chosen implementation."
             )
         },
     )

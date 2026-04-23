@@ -43,7 +43,7 @@ from llava.mm_utils import process_image
 from llava.model import LlavaLlamaConfig, LlavaLlamaModel, LlavaTopDownLlamaConfig, LlavaTopDownLlamaModel
 from llava.model.language_model.fp8linearqwen2 import Qwen2ForCausalLM  # We need this line to register AutoConfig
 from llava.model.language_model.qllava_qllama import QLlavaLlamaModel, quantize_args_to_model_class
-from llava.train.linear_attn import ParallelLinearAdapter, LizardAttention, LinearGatedCache, apply_linear_attn_monkey_patches
+from llava.train.linear_attn import ParallelLinearAdapter, LizardAttention, LinearGatedCache, apply_linear_attn_monkey_patches, VanillaLinearAttention
 from llava.train.args import DataArguments, ModelArguments, TrainingArguments
 from llava.train.callbacks.autoresume_callback import AutoResumeCallback
 from llava.train.llava_trainer import LLaVATopDownTrainer, LLaVATrainer, VILADPOTrainer
@@ -662,6 +662,7 @@ def train():
         # Build a registry so new attention types can be added without touching this block.
         _ATTENTION_REGISTRY = {
             "lizard": LizardAttention,
+            "linear_attn": VanillaLinearAttention,
         }
 
         if attention_type not in ("softmax", "default") and attention_type not in _ATTENTION_REGISTRY:
@@ -674,8 +675,9 @@ def train():
         if attention_type in _ATTENTION_REGISTRY:
             attn_cls = _ATTENTION_REGISTRY[attention_type]
 
-            if attention_type == "lizard":
-                # Patch decoder-layer forward to handle LizardAttention's 2-tuple return.
+            if attention_type in ("lizard", "linear_attn"):
+                # Patch decoder-layer forward to handle the 3-tuple return used
+                # by LizardAttention and its VanillaLinearAttention subclass.
                 apply_linear_attn_monkey_patches()
 
             llm = model.get_llm()
@@ -938,7 +940,21 @@ def train():
     if training_args.distill_enable:
         stage_type = getattr(training_args, "stage_type", "default").lower()
         if stage_type == "stage1":
-            mprint("Applying stage1 training policy: monkey-patch self_attn with LizardAttention.")
+            attention_type = getattr(training_args, "attention_type", "lizard").lower()
+            _STAGE1_ATTENTION_REGISTRY = {
+                "lizard": LizardAttention,
+                "linear_attn": VanillaLinearAttention,
+            }
+            if attention_type in ("softmax", "default"):
+                attention_type = "lizard"
+            if attention_type not in _STAGE1_ATTENTION_REGISTRY:
+                raise ValueError(
+                    f"stage1: unknown attention_type '{attention_type}'. "
+                    f"Supported values: {list(_STAGE1_ATTENTION_REGISTRY)}."
+                )
+
+            attn_cls = _STAGE1_ATTENTION_REGISTRY[attention_type]
+            mprint(f"Applying stage1 training policy: monkey-patch self_attn with {attn_cls.__name__}.")
 
             # Patch Qwen2DecoderLayer.forward and Qwen2ForCausalLM.forward for stage1 output
             apply_linear_attn_monkey_patches()
@@ -962,13 +978,13 @@ def train():
             for layer in layers:
                 if not hasattr(layer, "self_attn"):
                     continue
-                layer.self_attn = LizardAttention(layer.self_attn)
+                layer.self_attn = attn_cls(layer.self_attn)
                 patched_count += 1
 
             if patched_count == 0:
                 raise ValueError("stage1: no self_attn modules found to patch.")
 
-            mprint(f"stage1: patched {patched_count} self_attn modules with LizardAttention.")
+            mprint(f"stage1: patched {patched_count} self_attn modules with {attn_cls.__name__}.")
 
             mprint(f"stage1: tuned modules include:")
             # import ipdb; ipdb.set_trace()

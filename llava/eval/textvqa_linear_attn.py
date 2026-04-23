@@ -1,15 +1,15 @@
 """
-TextVQA eval for Lizard stage2 checkpoints.
+TextVQA eval for vanilla-linear-attention stage2 checkpoints.
 
 Stage2 checkpoints cannot be loaded with plain llava.load() because they are
-LoRA adapters on top of a Lizard-patched NVILA model.  Use this script instead
-of textvqa.py when evaluating a stage2 Lizard checkpoint.
+LoRA adapters on top of a VanillaLinearAttention-patched NVILA model.  Use
+this script instead of textvqa.py when evaluating a vanilla-LA stage2
+checkpoint.
 
 Usage:
-    torchrun --nproc-per-node=N llava/eval/textvqa_lizard.py \
+    torchrun --nproc-per-node=N llava/eval/textvqa_linear_attn.py \
         --base-model  Efficient-Large-Model/NVILA-8B         \
-        --stage1-ckpt runs/train/.../checkpoint-1500         \
-        --stage2-ckpt runs/train/.../checkpoint-20194        \
+        --stage2-ckpt runs/train/.../checkpoint-XXXXX        \
         --conv-mode   hermes-2                               \
         --output-dir  runs/eval/.../textvqa
 """
@@ -25,7 +25,7 @@ from tqdm import tqdm
 
 from llava import conversation as conversation_lib
 from llava.data.builder import DATASETS
-from llava.eval.load_lizard_model import load_lizard_stage2_alone, load_lizard_stage2_model
+from llava.eval.load_linear_attn_model import load_linear_attn_stage2_alone
 from llava.eval.m4c_evaluator import TextVQAAccuracyEvaluator
 from llava.utils import distributed as dist
 from llava.utils import io
@@ -71,22 +71,13 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base-model", type=str, required=True,
                         help="Path or HF ID of the base model (e.g. Efficient-Large-Model/NVILA-8B)")
-    parser.add_argument("--stage1-ckpt", type=str, default=None,
-                        help="Optional stage1 checkpoint dir. If omitted, the loader consolidates "
-                             "stage2's DeepSpeed ZeRO shards (global_step*/) and loads everything "
-                             "from stage2 alone via load_lizard_stage2_alone.")
     parser.add_argument("--stage2-ckpt", type=str, required=True,
-                        help="Path to stage2 checkpoint dir (contains adapter_model.safetensors)")
+                        help="Path to stage2 checkpoint dir (contains adapter_model.safetensors "
+                             "and global_step*/ with DeepSpeed ZeRO shards)")
     parser.add_argument("--conv-mode", type=str, required=True)
     parser.add_argument("--max-tiles", type=int, default=12)
     parser.add_argument("--generation-config", type=json.loads)
     parser.add_argument("--output-dir", type=str, required=True)
-    # Root-cause-2 fix: GLA inference with LinearGatedCache compresses the entire
-    # image context (2352+ tokens) into a fixed-size recurrent state h before the
-    # first generated token, which is lossy.  Full-sequence mode re-runs
-    # chunk_simple_gla on the full context at every generation step (identical to
-    # training teacher-forcing), avoiding this information loss.
-    # Pass --use-cache to opt back into the fast but lossy recurrent path.
     parser.add_argument(
         "--no-cache",
         dest="use_cache",
@@ -106,35 +97,23 @@ def main() -> None:
     image_dir = DATASETS["textvqa"]["image_dir"]
     answer_path = DATASETS["textvqa"]["answer_path"]
 
-    # Set up distributed environment
     dist.init()
     devices = range(dist.local_rank(), torch.cuda.device_count(), dist.local_size())
     torch.cuda.set_device(devices[0])
 
     conversation_lib.default_conversation = conversation_lib.conv_templates[args.conv_mode].copy()
 
-    # Load Lizard stage2 model
-    if args.stage1_ckpt:
-        model = load_lizard_stage2_model(
-            base_model_path=args.base_model,
-            stage1_ckpt_path=args.stage1_ckpt,
-            stage2_ckpt_path=args.stage2_ckpt,
-            devices=devices,
-        )
-    else:
-        model = load_lizard_stage2_alone(
-            base_model_path=args.base_model,
-            stage2_ckpt_path=args.stage2_ckpt,
-            devices=devices,
-        )
+    model = load_linear_attn_stage2_alone(
+        base_model_path=args.base_model,
+        stage2_ckpt_path=args.stage2_ckpt,
+        devices=devices,
+    )
 
-    # Configure tile counts
     model.config.min_tiles = 1
     model.config.max_tiles = args.max_tiles
     model.llm.config.min_tiles = 1
     model.llm.config.max_tiles = args.max_tiles
 
-    # Adjust context length
     context_length = model.tokenizer.model_max_length
     if args.max_tiles > 12:
         context_length = max(context_length, int(args.max_tiles / 12.0 * 4096))
@@ -144,21 +123,15 @@ def main() -> None:
     model.llm.config.tokenizer_model_max_length = context_length
     model.tokenizer.model_max_length = context_length
 
-    # Set up generation config
     generation_config = model.default_generation_config
     if args.generation_config is not None:
         generation_config.update(**args.generation_config)
-    # Root-cause-2 fix: full-sequence mode (matches training).
-    # When use_cache=False the LinearGatedCache injection in patched_causal_lm_forward
-    # is skipped, so chunk_simple_gla processes the full context at every step.
     generation_config.use_cache = args.use_cache
     logger.info(f"use_cache={generation_config.use_cache} "
                 f"({'recurrent/cache' if args.use_cache else 'full-sequence/no-cache'})")
 
-    # Load data and chunk for this rank
     instances = io.load(data_path)[dist.rank() :: dist.size()]
 
-    # Run inference
     outputs = []
     for instance in tqdm(instances, disable=not dist.is_main()):
         image = Image.open(os.path.join(image_dir, instance["image"]))
@@ -166,7 +139,6 @@ def main() -> None:
         response = model.generate_content([image, question], generation_config=generation_config)
         outputs.append({"question_id": instance["question_id"], "prompt": question, "text": response})
 
-    # Gather and save
     if dist.size() > 1:
         outputs = dist.gather(outputs, dst=0)
         if not dist.is_main():

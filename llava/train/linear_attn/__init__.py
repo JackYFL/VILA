@@ -2,3 +2,4 @@ from .parallel_adapter import ParallelLinearAdapter
 from .lizard_attn import LizardAttention
 from .lizard_cache import LinearGatedCache
 from .monkey_patch import apply_linear_attn_monkey_patches
+from .vanilla_linear_attn import VanillaLinearAttention
