@@ -14,16 +14,27 @@ from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from fla.ops.linear_attn import chunk_linear_attn, fused_recurrent_linear_attn
 
+
+def _phi(x: torch.Tensor) -> torch.Tensor:
+    """Positive feature map (Katharopoulos et al. 2020): elu(x) + 1.
+
+    Ensures Q·K >= 0 so that the cumulative denominator in chunk_linear_attn
+    with normalize=True stays positive and well-conditioned, avoiding the
+    divide-by-near-zero / sign-flip blow-ups seen without a feature map.
+    """
+    return F.elu(x) + 1.0
+
 from llava.train.linear_attn.lizard_attn import (
-    FeatureMap,
     LizardAttention,
     qwen2_flash_attention,
     repeat_kv,
 )
 from llava.train.linear_attn.lizard_cache import LinearGatedCache
+from llava.train.linear_attn.parallel_adapter import ParallelLinearAdapter
 
 
 def linear_attention_func(
@@ -105,45 +116,32 @@ class VanillaLinearAttention(LizardAttention):
         self.scaling = getattr(base_attention_module, "scaling", base_attention_module.head_dim ** -0.5)
         self.use_base_attention = use_base_attention
 
-        ref_dtype = base_attention_module.q_proj.weight.dtype
-        ref_device = base_attention_module.q_proj.weight.device
-
-        # Frozen q/k/v/o projections
+        # Frozen base q/k/v/o projections — feed the softmax / distillation
+        # reference branch only. The linear-attention branch uses a parallel
+        # trainable copy (linear_q/k/v_proj) created below.
         self.q_proj = base_attention_module.q_proj
         self.k_proj = base_attention_module.k_proj
         self.v_proj = base_attention_module.v_proj
-        for proj in (self.q_proj, self.k_proj, self.v_proj):
+        self.o_proj = base_attention_module.o_proj
+        for proj in (self.q_proj, self.k_proj, self.v_proj, self.o_proj):
             for p in proj.parameters():
                 p.requires_grad_(False)
-
-        self.o_proj = base_attention_module.o_proj
-        for p in self.o_proj.parameters():
-            p.requires_grad_(False)
 
         if hasattr(base_attention_module, "rotary_emb"):
             self.rotary_emb = base_attention_module.rotary_emb
             for p in self.rotary_emb.parameters():
                 p.requires_grad_(False)
 
-        # Trainable feature maps (same as Lizard)
-        self.feature_map_q = FeatureMap(
-            num_heads=self.num_attention_heads,
-            head_dim=self.head_dim,
-            feature_dim=self.head_dim,
-            dtype=ref_dtype,
-            device=ref_device,
-            head_first=False,
-        )
-        self.feature_map_k = FeatureMap(
-            num_heads=self.num_key_value_heads,
-            head_dim=self.head_dim,
-            feature_dim=self.head_dim,
-            dtype=ref_dtype,
-            device=ref_device,
-            head_first=False,
-        )
+        # Trainable parallel q/k/v for the linear-attention path.
+        # ParallelLinearAdapter deep-copies the base weights (ZeRO-3 safe) and
+        # sets requires_grad=True on the inner `adapter` nn.Linear. These are
+        # constructed after base-model init, so they stay full-shape under ZeRO-3.
+        self.linear_q_proj = ParallelLinearAdapter(base_attention_module.q_proj)
+        self.linear_k_proj = ParallelLinearAdapter(base_attention_module.k_proj)
+        self.linear_v_proj = ParallelLinearAdapter(base_attention_module.v_proj)
 
         # NOTE: no gated_proj — vanilla linear attention has no gate.
+        # NOTE: no feature maps — linear_q/k/v_proj absorb that capacity.
 
         del base_attention_module
 
@@ -162,30 +160,38 @@ class VanillaLinearAttention(LizardAttention):
         batch_size, seq_len, _ = hidden_states.size()
 
         hidden_shape = (batch_size, seq_len, -1, self.head_dim)
-        query_states = self.q_proj(hidden_states).view(hidden_shape)
-        key_states = self.k_proj(hidden_states).view(hidden_shape)
-        value_states = self.v_proj(hidden_states).view(hidden_shape)
+
+        # Linear-attention branch: use the trainable parallel projections.
+        # Apply a positive feature map (elu+1) to Q/K so that chunk_linear_attn's
+        # normalize=True denominator stays strictly positive. V is left untouched.
+        linear_query_states = _phi(self.linear_q_proj(hidden_states).view(hidden_shape))
+        linear_key_states = _phi(self.linear_k_proj(hidden_states).view(hidden_shape))
+        linear_value_states = self.linear_v_proj(hidden_states).view(hidden_shape)
 
         if isinstance(past_key_value, LinearGatedCache):
             past_h = past_key_value.get_hidden_state(self.layer_idx)
             linear_attn_output, final_h = linear_attention_func_with_cache(
-                query_states=self.feature_map_q(query_states),
-                key_states=self.feature_map_k(key_states),
-                value_states=value_states,
+                query_states=linear_query_states,
+                key_states=linear_key_states,
+                value_states=linear_value_states,
                 num_key_value_groups=self.num_key_value_groups,
                 past_hidden_state=past_h,
             )
             past_key_value.update_hidden_state(final_h, self.layer_idx, seq_len)
         else:
             linear_attn_output = linear_attention_func(
-                query_states=self.feature_map_q(query_states),
-                key_states=self.feature_map_k(key_states),
-                value_states=value_states,
+                query_states=linear_query_states,
+                key_states=linear_key_states,
+                value_states=linear_value_states,
                 num_key_value_groups=self.num_key_value_groups,
             )
 
         softmax_attn_output = None
         if self.training and (self.use_base_attention or output_attentions):
+            # Softmax / distillation reference branch uses the frozen base projections.
+            query_states = self.q_proj(hidden_states).view(hidden_shape)
+            key_states = self.k_proj(hidden_states).view(hidden_shape)
+            value_states = self.v_proj(hidden_states).view(hidden_shape)
             softmax_attn_output = qwen2_flash_attention(
                 query_states=query_states,
                 key_states=key_states,

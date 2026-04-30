@@ -700,12 +700,13 @@ def train():
         else:
             mprint("stage2: attention_type='softmax', keeping original self_attn unchanged.")
 
-        # Step 2: load stage1 checkpoint (brings in trained LizardAttention adapter weights).
-        # Under DeepSpeed ZeRO-3, original q/k/v/o_proj weights are partitioned (shape [0]),
+        # Step 2: load stage1 checkpoint (brings in the stage1-trained attention modules).
+        # Under DeepSpeed ZeRO-3, the base q/k/v/o_proj weights are partitioned (shape [0]),
         # but those weights were FROZEN in stage1 and are identical to the base model — no
-        # need to reload them. We only need the newly trained LizardAttention params:
-        # feature_map_q, feature_map_k, gated_proj — which have full shapes because they
-        # were created after ZeRO-3 model init.
+        # need to reload them. We only need the newly trained attention-specific params,
+        # which have full shapes because they were created after ZeRO-3 model init:
+        #   - lizard:      feature_map_q, feature_map_k, gated_proj
+        #   - linear_attn: linear_q_proj, linear_k_proj, linear_v_proj (ParallelLinearAdapter)
         stage1_ckpt = getattr(training_args, "stage1_checkpoint_path", None)
         if stage1_ckpt:
             import glob as _glob
@@ -714,7 +715,7 @@ def train():
             # VILA DeepSpeed checkpoints store the consolidated LLM under a `llm/` subdir.
             _llm_subdir = os.path.join(stage1_ckpt, "llm")
             _ckpt_dir = _llm_subdir if os.path.isdir(_llm_subdir) else stage1_ckpt
-            mprint(f"stage2: loading LizardAttention weights from {_ckpt_dir}")
+            mprint(f"stage2: loading stage1 ({attention_type}) weights from {_ckpt_dir}")
 
             # Collect all shard files into a flat state dict.
             _ckpt_state_dict = {}
@@ -731,16 +732,21 @@ def train():
             if not _ckpt_state_dict:
                 raise ValueError(f"stage2: no model weights found in {_ckpt_dir}")
 
-            # Keep only the LizardAttention-specific keys (newly created, full-shape tensors).
-            # Skipping q/k/v/o_proj avoids ZeRO-3 size-mismatch errors and is correct
+            # Keep only the attention-type-specific keys (newly created, full-shape tensors).
+            # Skipping the base q/k/v/o_proj avoids ZeRO-3 size-mismatch errors and is correct
             # because those weights were frozen in stage1 (unchanged from the base model).
-            _lizard_keys = ("feature_map_q.", "feature_map_k.", "gated_proj.")
+            if attention_type == "linear_attn":
+                _whitelist = ("linear_q_proj.", "linear_k_proj.", "linear_v_proj.")
+            elif attention_type == "lizard":
+                _whitelist = ("feature_map_q.", "feature_map_k.", "gated_proj.")
+            else:
+                _whitelist = ()
             _adapter_dict = {k: v for k, v in _ckpt_state_dict.items()
-                             if any(lk in k for lk in _lizard_keys)}
+                             if any(lk in k for lk in _whitelist)}
 
             missing, unexpected = model.get_llm().load_state_dict(_adapter_dict, strict=False)
             mprint(
-                f"stage2: loaded {len(_adapter_dict)} LizardAttention weight tensors "
+                f"stage2: loaded {len(_adapter_dict)} stage1 ({attention_type}) weight tensors "
                 f"(missing: {len(missing)}, unexpected: {len(unexpected)})."
             )
         else:
@@ -758,11 +764,27 @@ def train():
     if training_args.lora_enable:
         from peft import LoraConfig, PeftModel, get_peft_model
 
+        _lora_target_modules = find_all_linear_names(
+            model, training_args.lora_llm, training_args.lora_vt
+        )
+        # For stage2 with linear_attn, the base q/k/v_proj are frozen reference
+        # projections for the softmax/distillation branch. LoRA should target the
+        # stage1-trained linear_q/k/v_proj adapters and o_proj only; the base
+        # q/k/v_proj are excluded.
+        if (
+            stage_type_str == "stage2"
+            and getattr(training_args, "attention_type", "softmax").lower() == "linear_attn"
+        ):
+            _lora_target_modules = [
+                n for n in _lora_target_modules
+                if not (n.endswith(".q_proj") or n.endswith(".k_proj") or n.endswith(".v_proj"))
+            ]
+
         lora_config = LoraConfig(
             use_dora=training_args.use_dora,
             r=training_args.lora_r,
             lora_alpha=training_args.lora_alpha,
-            target_modules=find_all_linear_names(model, training_args.lora_llm, training_args.lora_vt),
+            target_modules=_lora_target_modules,
             lora_dropout=training_args.lora_dropout,
             bias=training_args.lora_bias,
             task_type="CAUSAL_LM",

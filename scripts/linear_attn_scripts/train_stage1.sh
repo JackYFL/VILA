@@ -8,7 +8,7 @@ set -e
 # ============================================================
 # Configurable parameters (override via env vars)
 # ============================================================
-DEFAULT_RUN_NAME="nvila-8b-llava-onevision-img-linear-attn-stage1"
+DEFAULT_RUN_NAME="nvila-8b-llava-onevision-img-vanilla-linear-attn-linearqkv-stage1"
 DEFAULT_PER_DEVICE_TRAIN_BATCH_SIZE=7
 DEFAULT_GRADIENT_ACCUMULATION_STEPS=4
 DEFAULT_LORA_R=64
@@ -156,7 +156,7 @@ torchrun \
         --save_strategy steps \
         --save_steps 100 \
         --save_total_limit 1 \
-        --learning_rate 1e-3 \
+        --learning_rate 5e-4 \
         --weight_decay 0. \
         --warmup_ratio 0.03 \
         --lr_scheduler_type constant \
