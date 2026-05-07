@@ -266,6 +266,10 @@ def masked_kl(
     return (kl * mask).sum() / mask.sum().clamp_min(1.0)
 
 
+def log_scalar(value: torch.Tensor) -> float:
+    return float(value.detach().float().item())
+
+
 class AdaLAStage2Trainer(LLaVATrainer):
     def __init__(self, *args, teacher_model=None, distill_args: AdaLAStage2Arguments = None, **kwargs):
         super().__init__(*args, **kwargs)
@@ -359,7 +363,7 @@ class AdaLAStage2Trainer(LLaVATrainer):
 
         hidden_loss = masked_mse(student_hidden[-1], teacher_hidden[-1], hidden_mask)
         loss = loss + self.distill_args.hidden_weight * hidden_loss
-        metrics["adala_hidden_loss"] = hidden_loss.detach()
+        metrics["adala_hidden_loss"] = log_scalar(hidden_loss)
 
         if self.distill_args.layer_weight > 0:
             layer_losses = []
@@ -368,7 +372,7 @@ class AdaLAStage2Trainer(LLaVATrainer):
             if layer_losses:
                 layer_loss = torch.stack(layer_losses).mean()
                 loss = loss + self.distill_args.layer_weight * layer_loss
-                metrics["adala_layer_loss"] = layer_loss.detach()
+                metrics["adala_layer_loss"] = log_scalar(layer_loss)
 
         if self.distill_args.logit_weight > 0:
             if student_logits is None or teacher_logits is None:
@@ -376,13 +380,13 @@ class AdaLAStage2Trainer(LLaVATrainer):
             logit_mask = labels.ne(IGNORE_INDEX) if labels is not None else attention_mask
             logit_loss = masked_kl(student_logits, teacher_logits, logit_mask, self.distill_args.temperature)
             loss = loss + self.distill_args.logit_weight * logit_loss
-            metrics["adala_logit_kl"] = logit_loss.detach()
+            metrics["adala_logit_kl"] = log_scalar(logit_loss)
 
         if self.distill_args.ce_weight > 0:
             if student_ce is None:
                 raise ValueError("ce_weight > 0 requires model loss in outputs.")
             loss = loss + self.distill_args.ce_weight * student_ce
-            metrics["adala_ce_loss"] = student_ce.detach()
+            metrics["adala_ce_loss"] = log_scalar(student_ce)
 
         self.log(metrics)
         return (loss, student_outputs) if return_outputs else loss
