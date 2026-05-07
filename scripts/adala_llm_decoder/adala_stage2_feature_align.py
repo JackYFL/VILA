@@ -8,6 +8,7 @@ import glob
 import math
 import os
 import copy
+from collections import defaultdict
 from dataclasses import dataclass, field, replace
 from typing import Dict, Optional
 
@@ -274,11 +275,11 @@ class AdaLAStage2Trainer(LLaVATrainer):
         self.teacher_model = teacher_model
         self.distill_args = distill_args
         self.teacher_model.eval()
-        # Keep submodules in eval mode, but make LlavaMetaForCausalLM._embed
-        # take its training-only distributed dummy-media path. Without this,
-        # ranks with no local image tensors call BasicImageEncoder on [].
-        self.teacher_model.training = True
         self.teacher_model.requires_grad_(False)
+
+    @staticmethod
+    def _unwrap(model):
+        return getattr(model, "module", model)
 
     @staticmethod
     def _forward_inputs(inputs):
@@ -295,20 +296,56 @@ class AdaLAStage2Trainer(LLaVATrainer):
         forward_inputs["packing"] = False
         return forward_inputs
 
+    @staticmethod
+    def _embed_with_student(model, inputs):
+        model = AdaLAStage2Trainer._unwrap(model)
+        media = inputs.get("media")
+        if media is None:
+            media = {}
+        media_config = inputs.get("media_config")
+        if media_config is None:
+            media_config = defaultdict(dict)
+        else:
+            media_config = copy.deepcopy(media_config)
+
+        return model._embed(
+            inputs.get("input_ids"),
+            media,
+            media_config,
+            inputs.get("labels"),
+            inputs.get("attention_mask"),
+        )
+
+    @staticmethod
+    def _llm_forward(model, inputs_embeds, labels, attention_mask):
+        model = AdaLAStage2Trainer._unwrap(model)
+        return model.get_llm()(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            labels=labels,
+            output_hidden_states=True,
+            use_cache=False,
+        )
+
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         del num_items_in_batch
 
+        inputs_embeds, embedded_labels, embedded_attention_mask = self._embed_with_student(model, inputs)
+
         with torch.no_grad():
-            teacher_outputs = self.teacher_model(**self._forward_inputs(inputs))
-        student_outputs = model(**self._forward_inputs(inputs))
+            teacher_outputs = self._llm_forward(
+                self.teacher_model,
+                inputs_embeds.detach(),
+                embedded_labels,
+                embedded_attention_mask,
+            )
+        student_outputs = self._llm_forward(model, inputs_embeds, embedded_labels, embedded_attention_mask)
 
         teacher_hidden, teacher_logits, _ = extract_hidden_and_logits(teacher_outputs)
         student_hidden, student_logits, student_ce = extract_hidden_and_logits(student_outputs)
 
-        labels = inputs.get("labels")
-        attention_mask = inputs.get("attention_mask")
-        if attention_mask is None and labels is not None:
-            attention_mask = labels.ne(IGNORE_INDEX)
+        labels = embedded_labels
+        attention_mask = embedded_attention_mask
 
         hidden_mask = attention_mask
         if self.distill_args.align_label_tokens_only and labels is not None:
