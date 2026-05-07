@@ -15,6 +15,7 @@ from typing import Dict, Optional
 import torch
 import torch.nn.functional as F
 from transformers import AutoConfig, HfArgumentParser, set_seed
+from transformers.integrations.deepspeed import unset_hf_deepspeed_config
 
 from llava import conversation as conversation_lib
 from llava.constants import IGNORE_INDEX
@@ -331,6 +332,8 @@ class AdaLAStage2Trainer(LLaVATrainer):
         del num_items_in_batch
 
         inputs_embeds, embedded_labels, embedded_attention_mask = self._embed_with_student(model, inputs)
+        if not inputs_embeds.requires_grad:
+            inputs_embeds.requires_grad_(True)
 
         with torch.no_grad():
             teacher_outputs = self._llm_forward(
@@ -424,8 +427,16 @@ def main():
         training_args, "teacher_model_name_or_path", None
     ) or model_args.model_name_or_path
 
+    # The teacher is called directly, not through a DeepSpeed engine. Disable
+    # HF ZeRO-3 init before constructing it; otherwise parameters such as
+    # RMSNorm weights are empty local shards (shape [0]) during teacher forward.
+    unset_hf_deepspeed_config()
     teacher_model_args = replace(model_args, model_name_or_path=distill_args.teacher_model_name_or_path)
-    teacher_training_args = replace(training_args, output_dir=os.path.join(training_args.output_dir, "_teacher_no_train"))
+    teacher_training_args = replace(
+        training_args,
+        output_dir=os.path.join(training_args.output_dir, "_teacher_no_train"),
+        deepspeed=None,
+    )
     teacher, _ = _build_model(teacher_model_args, data_args, teacher_training_args)
     _prepare_tokenizer_and_data_args(teacher, teacher_model_args, data_args, teacher_training_args)
     teacher.eval()
@@ -442,10 +453,10 @@ def main():
     if training_args.bits == 16:
         if training_args.bf16:
             student.to(torch.bfloat16)
-            teacher.to(torch.bfloat16)
+            teacher.to(device=training_args.device, dtype=torch.bfloat16)
         if training_args.fp16:
             student.to(torch.float16)
-            teacher.to(torch.float16)
+            teacher.to(device=training_args.device, dtype=torch.float16)
 
     trainable = sum(p.numel() for p in student.parameters() if p.requires_grad)
     total = sum(p.numel() for p in student.parameters())
