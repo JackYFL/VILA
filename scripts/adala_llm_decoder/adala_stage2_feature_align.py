@@ -7,6 +7,7 @@ This runner is intentionally additive. It does not modify llava/train/*.py.
 import glob
 import math
 import os
+import copy
 from dataclasses import dataclass, field, replace
 from typing import Dict, Optional
 
@@ -273,19 +274,33 @@ class AdaLAStage2Trainer(LLaVATrainer):
         self.teacher_model = teacher_model
         self.distill_args = distill_args
         self.teacher_model.eval()
+        # Keep submodules in eval mode, but make LlavaMetaForCausalLM._embed
+        # take its training-only distributed dummy-media path. Without this,
+        # ranks with no local image tensors call BasicImageEncoder on [].
+        self.teacher_model.training = True
         self.teacher_model.requires_grad_(False)
+
+    @staticmethod
+    def _forward_inputs(inputs):
+        forward_inputs = dict(inputs)
+        if "media" in forward_inputs and isinstance(forward_inputs["media"], dict):
+            forward_inputs["media"] = {
+                key: (list(value) if isinstance(value, list) else value)
+                for key, value in forward_inputs["media"].items()
+            }
+        if "media_config" in forward_inputs:
+            forward_inputs["media_config"] = copy.deepcopy(forward_inputs["media_config"])
+        forward_inputs["output_hidden_states"] = True
+        forward_inputs["use_cache"] = False
+        forward_inputs["packing"] = False
+        return forward_inputs
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         del num_items_in_batch
 
-        forward_inputs = dict(inputs)
-        forward_inputs["output_hidden_states"] = True
-        forward_inputs["use_cache"] = False
-        forward_inputs["packing"] = False
-
         with torch.no_grad():
-            teacher_outputs = self.teacher_model(**forward_inputs)
-        student_outputs = model(**forward_inputs)
+            teacher_outputs = self.teacher_model(**self._forward_inputs(inputs))
+        student_outputs = model(**self._forward_inputs(inputs))
 
         teacher_hidden, teacher_logits, _ = extract_hidden_and_logits(teacher_outputs)
         student_hidden, student_logits, student_ce = extract_hidden_and_logits(student_outputs)
