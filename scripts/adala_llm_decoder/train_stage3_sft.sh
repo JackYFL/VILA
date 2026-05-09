@@ -13,7 +13,21 @@ DEFAULT_LORA_DROPOUT=0.05
 MODEL_PATH=${MODEL_PATH:-"Efficient-Large-Model/NVILA-8B"}
 ATTENTION_TYPE=${ATTENTION_TYPE:-"lizard"}
 STAGE2_CHECKPOINT_PATH=${STAGE2_CHECKPOINT_PATH:-"runs/train/adala-llm-stage2-feature-align-${ATTENTION_TYPE}/model"}
-STAGE1_CHECKPOINT_PATH=${STAGE1_CHECKPOINT_PATH:-"${STAGE2_CHECKPOINT_PATH}/attention_only"}
+
+if [ -d "${STAGE2_CHECKPOINT_PATH}" ] && [ ! -d "${STAGE2_CHECKPOINT_PATH}/llm" ]; then
+    LATEST_STAGE2_CHECKPOINT=$(find "${STAGE2_CHECKPOINT_PATH}" -maxdepth 1 -type d -name 'checkpoint-*' | sort -V | tail -n 1)
+    if [ -n "${LATEST_STAGE2_CHECKPOINT}" ]; then
+        STAGE2_CHECKPOINT_PATH="${LATEST_STAGE2_CHECKPOINT}"
+    fi
+fi
+
+if [ ! -d "${STAGE2_CHECKPOINT_PATH}/llm" ] && [ ! -f "${STAGE2_CHECKPOINT_PATH}/model.safetensors.index.json" ]; then
+    echo "Could not find model weights under STAGE2_CHECKPOINT_PATH=${STAGE2_CHECKPOINT_PATH}" >&2
+    echo "Set STAGE2_CHECKPOINT_PATH to a stage2 checkpoint directory, e.g. .../model/checkpoint-7561" >&2
+    exit 1
+fi
+
+STAGE1_CHECKPOINT_PATH=${STAGE1_CHECKPOINT_PATH:-"${STAGE2_CHECKPOINT_PATH}"}
 
 DATA_ROOT=${DATA_ROOT:-"/mnt/localssd/data"}
 METADATA_DIR=${METADATA_DIR:-"${DATA_ROOT}/LLaVA-OneVision-Data-processed/metadata"}
@@ -138,4 +152,3 @@ torchrun \
         --dataloader_num_workers ${DATALOADER_NUM_WORKERS:-8} \
         --vflan_no_system_prompt True \
         --report_to ${REPORT_TO:-wandb}
-
